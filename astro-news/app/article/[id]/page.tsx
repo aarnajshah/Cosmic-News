@@ -6,16 +6,124 @@ import { ArrowLeft, Rocket } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { newsData } from "@/lib/data"
 import { formatDate } from "@/lib/utils"
+import { useEffect, useState } from "react"
+import type { Article } from "@/lib/types"
 
-export default function ArticlePage({ params }: { params: { id: string } }) {
+export default function ArticlePage({ params }: { params: Promise<{ id: string }> }) {
   const router = useRouter()
-  const article = newsData.find((item) => item.id === params.id)
+  const [article, setArticle] = useState<Article | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [articleId, setArticleId] = useState<string | null>(null)
 
-  if (!article) {
+  useEffect(() => {
+    const getParams = async () => {
+      const resolvedParams = await params
+      setArticleId(resolvedParams.id)
+    }
+    getParams()
+  }, [params])
+
+  useEffect(() => {
+    if (!articleId) return
+
+    const loadArticle = async () => {
+      try {
+        setLoading(true)
+        setError(null)
+
+        // First try to find in static newsData
+        const staticArticle = newsData.find((item) => item.id === articleId)
+        if (staticArticle) {
+          setArticle(staticArticle)
+          setLoading(false)
+          return
+        }
+
+        // If not found in static data, fetch from API and find the article
+        const response = await fetch('/api/nasa', { cache: 'no-store' })
+        if (!response.ok) {
+          throw new Error('Failed to fetch articles')
+        }
+
+        const data = await response.json()
+        const scrapedArticle = data.articles?.find((item: Article) => item.id === articleId)
+        
+        if (scrapedArticle) {
+          // Extract the original URL from the content
+          const urlMatch = scrapedArticle.content.match(/https?:\/\/[^\s]+/)
+          const originalUrl = urlMatch?.[0]
+
+          if (originalUrl) {
+            // Fetch the full article content
+            try {
+              const fullContentResponse = await fetch(`/api/article?url=${encodeURIComponent(originalUrl)}`, {
+                cache: 'no-store'
+              })
+              
+              if (fullContentResponse.ok) {
+                const fullContentData = await fullContentResponse.json()
+                if (fullContentData.article) {
+                  const enhancedArticle = {
+                    ...scrapedArticle,
+                    title: fullContentData.article.title || scrapedArticle.title,
+                    content: fullContentData.article.content || scrapedArticle.content,
+                    imageUrl: fullContentData.article.imageUrl || scrapedArticle.imageUrl,
+                    date: fullContentData.article.date || scrapedArticle.date,
+                  }
+                  setArticle(enhancedArticle)
+                  setLoading(false)
+                  return
+                }
+              }
+            } catch (fullContentError) {
+              console.log('Could not fetch full content, using summary:', fullContentError)
+            }
+          }
+
+          // Fallback to enhanced summary if full content fails
+          const enhancedArticle = {
+            ...scrapedArticle,
+            content: `${scrapedArticle.summary}
+
+This article was originally published on ${scrapedArticle.source}. 
+
+To read the complete article with all details, images, and full content, please visit the original source using the button below.
+
+This is a breaking news story and may be updated as more information becomes available.`
+          }
+          setArticle(enhancedArticle)
+        } else {
+          setError('Article not found')
+        }
+      } catch (err) {
+        console.error('Error loading article:', err)
+        setError('Failed to load article')
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadArticle()
+  }, [articleId])
+
+  if (loading) {
+    return (
+      <div className="min-h-screen stars-bg flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+          <p className="text-muted-foreground">Loading article...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error || !article) {
     return (
       <div className="min-h-screen stars-bg flex items-center justify-center">
         <div className="text-center">
           <h1 className="text-2xl font-bold mb-4">Article not found</h1>
+          <p className="text-muted-foreground mb-4">{error || "The article you're looking for doesn't exist."}</p>
           <Button onClick={() => router.push("/dashboard")}>Back to Dashboard</Button>
         </div>
       </div>
@@ -62,6 +170,27 @@ export default function ArticlePage({ params }: { params: { id: string } }) {
               <p key={index}>{paragraph}</p>
             ))}
           </div>
+
+          {/* If this is a scraped article, show link to original */}
+          {article.content.includes("Read the full article at") && (
+            <div className="mt-8 p-6 bg-card/50 rounded-lg border border-border/50">
+              <h3 className="text-lg font-semibold mb-3">Read Full Article</h3>
+              <p className="text-muted-foreground mb-4">
+                This is a preview of the article. For the complete story with all details and images, visit the original source.
+              </p>
+              <Button 
+                onClick={() => {
+                  const urlMatch = article.content.match(/https?:\/\/[^\s]+/)
+                  if (urlMatch) {
+                    window.open(urlMatch[0], '_blank', 'noopener,noreferrer')
+                  }
+                }}
+                className="w-full sm:w-auto"
+              >
+                Read Full Article on {article.source}
+              </Button>
+            </div>
+          )}
         </article>
       </main>
 
