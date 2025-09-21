@@ -19,10 +19,14 @@ export async function GET(request: Request) {
       accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
       "accept-language": "en-US,en;q=0.5",
       "accept-encoding": "gzip, deflate, br",
-      referer: "https://www.space.com/",
+      referer: articleUrl.includes('nasa.gov') 
+        ? "https://www.nasa.gov/" 
+        : articleUrl.includes('nationalgeographic.com')
+        ? "https://www.nationalgeographic.com/"
+        : "https://www.space.com/",
       "sec-fetch-dest": "document",
       "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "same-origin",
+      "sec-fetch-site": "cross-site",
       "upgrade-insecure-requests": "1",
     }
 
@@ -50,6 +54,10 @@ export async function GET(request: Request) {
       'h1[data-testid="ArticleName"]',
       '.article-header h1',
       'header h1',
+      // NASA-specific selectors
+      '.article-title h1',
+      '.page-title h1',
+      'main h1',
       'h1',
     ]
 
@@ -70,6 +78,12 @@ export async function GET(request: Request) {
       '.entry-content',
       'article .text-copy',
       '.vanilla-body',
+      // NASA-specific selectors
+      '.article-text',
+      '.article-content-body',
+      '.content',
+      'main .text',
+      '.article-main-content',
     ]
 
     for (const selector of contentSelectors) {
@@ -101,6 +115,12 @@ export async function GET(request: Request) {
       'figure.article-lead-image-wrap img',
       '.main-image img',
       'article img',
+      // NASA-specific selectors
+      '.article-hero img',
+      '.featured-image img',
+      '.article-image img',
+      'figure img',
+      'img[src*="nasa.gov"]',
     ]
 
     for (const selector of imageSelectors) {
@@ -108,16 +128,25 @@ export async function GET(request: Request) {
       if (imgEl.length > 0) {
         let imgSrc = imgEl.attr('data-original') || 
                     imgEl.attr('data-src') || 
+                    imgEl.attr('data-lazy-src') ||
                     imgEl.attr('src')
         
         if (imgSrc) {
           if (imgSrc.startsWith('//')) {
             imgSrc = `https:${imgSrc}`
           } else if (imgSrc.startsWith('/')) {
-            imgSrc = `https://www.space.com${imgSrc}`
+            // Determine the base URL based on the article URL
+            let baseUrl = 'https://www.space.com'
+            if (articleUrl.includes('nasa.gov')) {
+              baseUrl = 'https://www.nasa.gov'
+            } else if (articleUrl.includes('nationalgeographic.com')) {
+              baseUrl = 'https://www.nationalgeographic.com'
+            }
+            imgSrc = `${baseUrl}${imgSrc}`
           }
           
-          if (imgSrc.includes('space.com') || imgSrc.includes('futurecdn.net')) {
+          // Accept images from NASA, National Geographic, and Space.com
+          if (imgSrc.includes('nasa.gov') || imgSrc.includes('nationalgeographic.com') || imgSrc.includes('space.com') || imgSrc.includes('futurecdn.net')) {
             imageUrl = imgSrc
             break
           }
@@ -131,13 +160,27 @@ export async function GET(request: Request) {
       '.publish-date',
       '.article-date',
       '[data-testid="PublishDate"]',
+      // NASA-specific selectors
+      'span.heading-12.text-uppercase',
+      'span[class*="heading-12"]',
+      '.article-meta .date',
+      '.release-date',
     ]
 
     for (const selector of dateSelectors) {
       const dateEl = $(selector).first()
       if (dateEl.length > 0) {
-        publishDate = dateEl.attr('datetime') || dateEl.text().trim()
-        if (publishDate) break
+        let dateStr = dateEl.attr('datetime') || dateEl.text().trim()
+        
+        if (dateStr) {
+          // Handle NASA's date format "Aug 20, 2025"
+          if (dateStr.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})/i)) {
+            publishDate = new Date(dateStr).toISOString()
+          } else {
+            publishDate = dateStr
+          }
+          break
+        }
       }
     }
 

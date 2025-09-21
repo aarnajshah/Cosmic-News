@@ -16,6 +16,11 @@ export default function DashboardPage() {
   const [articles, setArticles] = useState<Article[]>(newsData)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [apiInfo, setApiInfo] = useState<{
+    cached?: boolean
+    filtered?: { total: number; recent: number; returned: number }
+    sources?: { nasa: number; natgeo: number; space: number }
+  } | null>(null)
 
   useEffect(() => {
     let isCancelled = false
@@ -28,6 +33,11 @@ export default function DashboardPage() {
         const data = await res.json()
         if (!isCancelled && Array.isArray(data?.articles) && data.articles.length > 0) {
           setArticles(data.articles)
+          setApiInfo({
+            cached: data.cached,
+            filtered: data.filtered,
+            sources: data.sources
+          })
         }
       } catch (e) {
         if (!isCancelled) {
@@ -146,6 +156,31 @@ export default function DashboardPage() {
 
       <main className="container mx-auto px-4 py-8">
         <h1 className="text-3xl font-bold mb-8">Latest Space News</h1>
+        <p className="text-muted-foreground mb-6">Discover the latest articles from NASA, National Geographic, and Space.com</p>
+
+        {/* API Status Information */}
+        {apiInfo && (
+          <div className="bg-secondary/50 backdrop-blur-sm p-4 rounded-lg border border-border/50 mb-6">
+            <div className="flex flex-wrap items-center gap-4 text-sm">
+              <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${apiInfo.cached ? 'bg-green-500' : 'bg-blue-500'}`}></div>
+                <span className="text-muted-foreground">
+                  {apiInfo.cached ? 'Cached data' : 'Live data'}
+                </span>
+              </div>
+              {apiInfo.filtered && (
+                <div className="text-muted-foreground">
+                  Showing {apiInfo.filtered.returned} of {apiInfo.filtered.recent} recent articles (from {apiInfo.filtered.total} total)
+                </div>
+              )}
+              {apiInfo.sources && (
+                <div className="text-muted-foreground">
+                  Sources: {apiInfo.sources.nasa} NASA, {apiInfo.sources.natgeo} NatGeo, {apiInfo.sources.space} Space.com
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {loading ? (
           <div className="text-center py-12">

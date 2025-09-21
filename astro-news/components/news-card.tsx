@@ -31,7 +31,15 @@ export function NewsCard({ article }: NewsCardProps) {
       </CardContent>
       <CardFooter className="px-4 py-3 border-t border-border/50 flex justify-between text-xs text-muted-foreground">
         <span>{formatDate(article.date)}</span>
-        <span>{article.source}</span>
+        <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+          article.source === "NASA" 
+            ? "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
+            : article.source === "National Geographic"
+            ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
+            : "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200"
+        }`}>
+          {article.source}
+        </span>
       </CardFooter>
     </Card>
   )
