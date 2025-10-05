@@ -1,0 +1,1216 @@
+import { NextResponse } from "next/server"
+import * as cheerio from "cheerio"
+import type { Article } from "@/lib/types"
+
+// Simple in-memory cache for articles
+let articleCache: { data: Article[], timestamp: number } | null = null
+const CACHE_TTL = 5 * 60 * 1000 // 5 minutes cache
+
+// Helper function to extract National Geographic images (based on Python scraper)
+function extractNatGeoImages(html: string): string[] {
+  const $ = cheerio.load(html)
+  const imageUrls: string[] = []
+  
+  const divs = $('div.BackgroundImage.BackgroundImage--zoom.PromoTile__Header__Image')
+  divs.each((_, div) => {
+    const style = $(div).attr('style') || ''
+    const match = style.match(/background-image:\s*url\("([^"]+)"\)/)
+    if (match && match[1]) {
+      let imgSrc = match[1]
+      if (imgSrc.startsWith('//')) {
+        imgSrc = `https:${imgSrc}`
+      } else if (imgSrc.startsWith('/')) {
+        imgSrc = `https://www.nationalgeographic.com${imgSrc}`
+      }
+      imageUrls.push(imgSrc)
+    }
+  })
+  
+  return imageUrls
+}
+
+function generateIdFromLink(link: string): string {
+  try {
+    return encodeURIComponent(link)
+  } catch {
+    return Math.random().toString(36).slice(2)
+  }
+}
+
+async function scrapeNasaNews(year: number = 2025): Promise<Article[]> {
+  const url = `https://www.nasa.gov/${year}-news-releases/`
+  
+  const headers = {
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.5",
+    "accept-encoding": "gzip, deflate, br",
+    referer: "https://www.google.com/",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "cross-site",
+    "upgrade-insecure-requests": "1",
+  }
+
+  try {
+    console.log(`Scraping NASA news: ${url}`)
+    
+    const res = await fetch(url, {
+      headers,
+      cache: "no-store",
+    })
+
+    if (!res.ok) {
+      throw new Error(`Failed to fetch NASA news: ${res.status}`)
+    }
+
+    const html = await res.text()
+    if (!html || html.length < 100) {
+      throw new Error("Empty response from NASA")
+    }
+
+    const $ = cheerio.load(html)
+    const results: Article[] = []
+
+    // Find each article block using NASA's structure
+    for (let i = 0; i < $('div.hds-content-item').length; i++) {
+      const item = $('div.hds-content-item').eq(i)
+      const $item = $(item)
+      const inner = $item.find('div.hds-content-item-inner')
+      
+      if (inner.length === 0) continue
+
+      // Debug: Log basic info for first few items
+      if (results.length < 2) {
+        console.log(`NASA Item ${results.length + 1} - Found article structure`)
+      }
+
+      // Extract the link
+      const linkEl = inner.find('a.hds-content-item-heading[href]')
+      // Extract the title
+      const titleEl = inner.find('div.hds-a11y-heading-22')
+
+      if (linkEl.length > 0 && titleEl.length > 0) {
+        let link = linkEl.attr('href') || ''
+        let title = titleEl.text().trim()
+
+        if (title && link) {
+          // Ensure absolute URL
+          if (link.startsWith("/")) {
+            link = `https://www.nasa.gov${link}`
+          } else if (!link.startsWith("http")) {
+            link = `https://www.nasa.gov/${link}`
+          }
+
+          // Get summary from description if available
+          const summaryEl = inner.find('div.hds-content-item-description, p')
+          let summary = summaryEl.text().trim() || title
+
+          // Extract publication date from various possible locations
+          let articleDate = new Date().toISOString() // fallback to current date
+          
+          // Try to find date in various formats and locations
+          // Based on the actual NASA structure, dates are in spans with "heading-12 text-uppercase" classes
+          const dateSelectors = [
+            'span.heading-12.text-uppercase', // NASA's actual date structure
+            'span[class*="heading-12"]', // More flexible version
+            'span[class*="text-uppercase"]', // Even more flexible
+            'time[datetime]',
+            '.hds-content-item-date',
+            '.date',
+            '.published-date',
+            '.release-date',
+            '[class*="date"]',
+            'span[class*="date"]',
+            '.hds-content-item-meta',
+            '.meta',
+            '[class*="meta"]'
+          ]
+          
+          // First try within the inner container
+          for (const dateSelector of dateSelectors) {
+            const dateEl = inner.find(dateSelector).first()
+            if (dateEl.length > 0) {
+              // Try datetime attribute first
+              let dateStr = dateEl.attr('datetime') || dateEl.text().trim()
+              
+              if (dateStr) {
+                // Clean up the date string but preserve the NASA format
+                dateStr = dateStr.trim()
+                
+                // Try to parse various date formats including NASA's "Aug 20, 2025" format
+                let parsedDate = new Date(dateStr)
+                
+                // If direct parsing fails, try to handle NASA's specific format
+                if (isNaN(parsedDate.getTime())) {
+                  // Handle formats like "Aug 20, 2025", "AUG 20, 2025", etc.
+                  const nasaDateMatch = dateStr.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})/i)
+                  if (nasaDateMatch) {
+                    const [, month, day, year] = nasaDateMatch
+                    parsedDate = new Date(`${month} ${day}, ${year}`)
+                  }
+                }
+                
+                if (!isNaN(parsedDate.getTime())) {
+                  articleDate = parsedDate.toISOString()
+                  console.log(`Found NASA date from inner selector ${dateSelector}: "${dateStr}" -> ${articleDate}`)
+                  break
+                }
+              }
+            }
+          }
+          
+          // If no date found in inner container, try the parent item container
+          if (articleDate === new Date().toISOString()) {
+            for (const dateSelector of dateSelectors) {
+              const dateEl = $item.find(dateSelector).first()
+              if (dateEl.length > 0) {
+                let dateStr = dateEl.attr('datetime') || dateEl.text().trim()
+                
+                if (dateStr) {
+                  dateStr = dateStr.trim()
+                  
+                  // Try to parse various date formats including NASA's "Aug 20, 2025" format
+                  let parsedDate = new Date(dateStr)
+                  
+                  // If direct parsing fails, try to handle NASA's specific format
+                  if (isNaN(parsedDate.getTime())) {
+                    // Handle formats like "Aug 20, 2025", "AUG 20, 2025", etc.
+                    const nasaDateMatch = dateStr.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})/i)
+                    if (nasaDateMatch) {
+                      const [, month, day, year] = nasaDateMatch
+                      parsedDate = new Date(`${month} ${day}, ${year}`)
+                    }
+                  }
+                  
+                  if (!isNaN(parsedDate.getTime())) {
+                    articleDate = parsedDate.toISOString()
+                    console.log(`Found NASA date from parent selector ${dateSelector}: "${dateStr}" -> ${articleDate}`)
+                    break
+                  }
+                }
+              }
+            }
+          }
+          
+          // If still no date found, try to extract from the URL pattern
+          if (articleDate === new Date().toISOString()) {
+            // Try to extract date from URL pattern (e.g., /2025/01/15/article-name)
+            const urlDateMatch = link.match(/\/(\d{4})\/(\d{1,2})\/(\d{1,2})\//)
+            if (urlDateMatch) {
+              const [, year, month, day] = urlDateMatch
+              const urlDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day))
+              if (!isNaN(urlDate.getTime())) {
+                articleDate = urlDate.toISOString()
+                console.log(`Found NASA date from URL: ${year}-${month}-${day} -> ${articleDate}`)
+              }
+            }
+          }
+          
+          // If still no date, try to extract from title (sometimes contains date info)
+          if (articleDate === new Date().toISOString()) {
+            const titleDateMatch = title.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})|(\d{4})-(\d{1,2})-(\d{1,2})/)
+            if (titleDateMatch) {
+              let year, month, day
+              if (titleDateMatch[3]) {
+                // MM/DD/YYYY format
+                [, month, day, year] = titleDateMatch
+              } else {
+                // YYYY-MM-DD format
+                [, , , year, month, day] = titleDateMatch
+              }
+              const titleDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day))
+              if (!isNaN(titleDate.getTime())) {
+                articleDate = titleDate.toISOString()
+                console.log(`Found NASA date from title: ${year}-${month}-${day} -> ${articleDate}`)
+              }
+            }
+          }
+          
+          // If still no date found, use the year from the URL and create a reasonable date
+          if (articleDate === new Date().toISOString()) {
+            // Since we're scraping from /2025-news-releases/, use 2025 as the year
+            // and create a date that's progressively older for each article
+            const daysAgo = results.length * 2 // Each article is 2 days older than the previous
+            const fallbackDate = new Date()
+            fallbackDate.setDate(fallbackDate.getDate() - daysAgo)
+            fallbackDate.setFullYear(year) // Use the year from the URL
+            articleDate = fallbackDate.toISOString()
+            console.log(`Using fallback NASA date for article ${results.length + 1}: ${articleDate} (${daysAgo} days ago)`)
+          }
+
+          // Try to find an image - NASA uses thumbnail links with images
+          let imageUrl = "/placeholder.svg"
+          
+          // Debug: Check what image elements exist
+          if (results.length < 2) {
+            console.log(`NASA Article ${results.length + 1} - Checking for image elements:`)
+            const thumbnailLinks = $item.find('a.hds-content-item-thumbnail')
+            console.log(`  Thumbnail links found: ${thumbnailLinks.length}`)
+            const allImages = $item.find('img')
+            console.log(`  All images found: ${allImages.length}`)
+          }
+          
+          // First try to find the thumbnail link structure (a.hds-content-item-thumbnail > img)
+          const thumbnailLink = $item.find('a.hds-content-item-thumbnail')
+          if (thumbnailLink.length > 0) {
+            const imgEl = thumbnailLink.find('img').first()
+            if (imgEl.length > 0) {
+              let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+              if (imgSrc) {
+                if (imgSrc.startsWith('//')) {
+                  imgSrc = `https:${imgSrc}`
+                } else if (imgSrc.startsWith('/')) {
+                  imgSrc = `https://www.nasa.gov${imgSrc}`
+                }
+                imageUrl = imgSrc
+                console.log(`Found NASA thumbnail image: ${imageUrl}`)
+              }
+            }
+          }
+          
+          // If no thumbnail found, try to find any image in the inner container
+          if (imageUrl === "/placeholder.svg") {
+            const imgEl = inner.find('img').first()
+            if (imgEl.length > 0) {
+              let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+              if (imgSrc) {
+                if (imgSrc.startsWith('//')) {
+                  imgSrc = `https:${imgSrc}`
+                } else if (imgSrc.startsWith('/')) {
+                  imgSrc = `https://www.nasa.gov${imgSrc}`
+                }
+                imageUrl = imgSrc
+                console.log(`Found NASA inner image: ${imageUrl}`)
+              }
+            }
+          }
+          
+          // If still no image, try to find any image in the entire item
+          if (imageUrl === "/placeholder.svg") {
+            const imgEl = $item.find('img').first()
+            if (imgEl.length > 0) {
+              let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+              if (imgSrc) {
+                if (imgSrc.startsWith('//')) {
+                  imgSrc = `https:${imgSrc}`
+                } else if (imgSrc.startsWith('/')) {
+                  imgSrc = `https://www.nasa.gov${imgSrc}`
+                }
+                imageUrl = imgSrc
+                console.log(`Found NASA item image: ${imageUrl}`)
+              }
+            }
+          }
+
+          // If no image found, use NASA-themed placeholder
+          if (imageUrl === "/placeholder.svg") {
+            const nasaImages = [
+              "https://www.nasa.gov/sites/default/files/thumbnails/image/nasa-logo-web-rgb.png",
+              "https://www.nasa.gov/sites/default/files/thumbnails/image/iss_crew_photo.jpg",
+              "https://www.nasa.gov/sites/default/files/thumbnails/image/artemis_mission.jpg",
+              "https://www.nasa.gov/sites/default/files/thumbnails/image/mars_rover.jpg",
+              "https://www.nasa.gov/sites/default/files/thumbnails/image/space_station.jpg"
+            ]
+            imageUrl = nasaImages[Math.floor(Math.random() * nasaImages.length)]
+          }
+
+          // Create the article object first
+          const article: Article = {
+            id: generateIdFromLink(link),
+            title: title.slice(0, 200),
+            summary: summary.slice(0, 300) || title.slice(0, 300),
+            content: `Read the full NASA article: ${link}`,
+            imageUrl: imageUrl,
+            date: articleDate,
+            source: "NASA",
+          }
+
+          // Try to fetch the individual article page to get the actual date
+          try {
+            console.log(`Fetching individual NASA article for date: ${link}`)
+            const articleResponse = await fetch(link, {
+              headers: {
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "accept-language": "en-US,en;q=0.5",
+                "accept-encoding": "gzip, deflate, br",
+                referer: "https://www.nasa.gov/",
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "same-origin",
+                "upgrade-insecure-requests": "1",
+              },
+              cache: "no-store",
+            })
+
+            if (articleResponse.ok) {
+              const articleHtml = await articleResponse.text()
+              const $article = cheerio.load(articleHtml)
+              
+              // Look for the date in the individual article page
+              const dateSelectors = [
+                'span.heading-12.text-uppercase',
+                'span[class*="heading-12"]',
+                'span[class*="text-uppercase"]',
+                'time[datetime]',
+                '.article-date',
+                '.publish-date',
+                '.release-date',
+                '[class*="date"]'
+              ]
+              
+              for (const dateSelector of dateSelectors) {
+                const dateEl = $article(dateSelector).first()
+                if (dateEl.length > 0) {
+                  let dateStr = dateEl.attr('datetime') || dateEl.text().trim()
+                  
+                  if (dateStr) {
+                    dateStr = dateStr.trim()
+                    
+                    // Try to parse NASA's date format "Sep 12, 2025"
+                    let parsedDate = new Date(dateStr)
+                    
+                    if (isNaN(parsedDate.getTime())) {
+                      const nasaDateMatch = dateStr.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{4})/i)
+                      if (nasaDateMatch) {
+                        const [, month, day, year] = nasaDateMatch
+                        parsedDate = new Date(`${month} ${day}, ${year}`)
+                      }
+                    }
+                    
+                    if (!isNaN(parsedDate.getTime())) {
+                      article.date = parsedDate.toISOString()
+                      console.log(`Found actual NASA date from individual article: "${dateStr}" -> ${article.date}`)
+                      break
+                    }
+                  }
+                }
+              }
+              
+              // Also try to get a better image from the individual article page
+              if (article.imageUrl === "/placeholder.svg" || article.imageUrl.includes('nasa-logo-web-rgb.png')) {
+                const imageSelectors = [
+                  '.article-hero img',
+                  '.featured-image img',
+                  '.article-image img',
+                  'figure img',
+                  'article img',
+                  'img[src*="nasa.gov"]'
+                ]
+                
+                for (const imgSelector of imageSelectors) {
+                  const imgEl = $article(imgSelector).first()
+                  if (imgEl.length > 0) {
+                    let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+                    if (imgSrc) {
+                      if (imgSrc.startsWith('//')) {
+                        imgSrc = `https:${imgSrc}`
+                      } else if (imgSrc.startsWith('/')) {
+                        imgSrc = `https://www.nasa.gov${imgSrc}`
+                      }
+                      
+                      if (imgSrc.includes('nasa.gov') && !imgSrc.includes('nasa-logo-web-rgb.png')) {
+                        article.imageUrl = imgSrc
+                        console.log(`Found better NASA image from individual article: ${imgSrc}`)
+                        break
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch (articleError) {
+            console.log(`Could not fetch individual NASA article for date: ${articleError}`)
+            // Keep the fallback date
+          }
+
+          results.push(article)
+        }
+      }
+    }
+
+    console.log(`Found ${results.length} NASA articles`)
+    return results.slice(0, 10) // Limit to 10 articles for faster loading
+
+  } catch (error) {
+    console.log(`Error fetching NASA news:`, error)
+    throw error
+  }
+}
+
+async function scrapeNatGeoSpace(): Promise<Article[]> {
+  const url = "https://www.nationalgeographic.com/science/topic/space"
+  
+  const headers = {
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.5",
+    "accept-encoding": "gzip, deflate, br",
+    referer: "https://www.google.com/",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "cross-site",
+    "upgrade-insecure-requests": "1",
+  }
+
+  try {
+    console.log(`Scraping National Geographic Space: ${url}`)
+    
+    const res = await fetch(url, {
+      headers,
+      cache: "no-store",
+    })
+
+    if (!res.ok) {
+      throw new Error(`Failed to fetch National Geographic: ${res.status}`)
+    }
+
+    const html = await res.text()
+    if (!html || html.length < 100) {
+      throw new Error("Empty response from National Geographic")
+    }
+
+    const $ = cheerio.load(html)
+    const results: Article[] = []
+
+    // Test the image extraction helper function
+    const extractedImages = extractNatGeoImages(html)
+    console.log(`National Geographic: Found ${extractedImages.length} images using Python-style extraction`)
+    if (extractedImages.length > 0) {
+      console.log(`Sample images: ${extractedImages.slice(0, 3).join(', ')}`)
+    }
+
+    // Find each article tile using National Geographic's structure
+    for (let i = 0; i < $('div.col[aria-label]').length; i++) {
+      const tile = $('div.col[aria-label]').eq(i)
+      const $tile = $(tile)
+      const title = $tile.attr('aria-label')?.trim()
+      
+      if (!title) continue
+
+      // Debug: Check what link elements exist
+      if (results.length < 2) {
+        console.log(`National Geographic Article ${results.length + 1} - Checking for link elements:`)
+        const promoLinks = $tile.find('a.AnchorLink.PromoTile_Link')
+        console.log(`  PromoTile_Link found: ${promoLinks.length}`)
+        const oldPromoLinks = $tile.find('a.AnchorLink.PromoTile__Link')
+        console.log(`  PromoTile__Link found: ${oldPromoLinks.length}`)
+        const allLinks = $tile.find('a[href]')
+        console.log(`  All links found: ${allLinks.length}`)
+      }
+
+      // Find the promo anchor link - National Geographic uses AnchorLink PromoTile_Link
+      let linkEl = $tile.find('a.AnchorLink.PromoTile_Link[href]').first()
+      if (linkEl.length === 0) {
+        // Fallback: try the old selector
+        linkEl = $tile.find('a.AnchorLink.PromoTile__Link[href]').first()
+      }
+      if (linkEl.length === 0) {
+        // Final fallback: any anchor
+        linkEl = $tile.find('a[href]').first()
+      }
+      
+      if (linkEl.length === 0) continue
+
+      let link = linkEl.attr('href') || ''
+      if (!link) continue
+
+      // Ensure absolute URL
+      if (link.startsWith('/')) {
+        link = `https://www.nationalgeographic.com${link}`
+      } else if (!link.startsWith('http')) {
+        link = `https://www.nationalgeographic.com/${link}`
+      }
+
+      // Try to find an image - National Geographic uses background images in divs
+      let imageUrl = "/placeholder.svg"
+      
+      // First try to use an image from the extracted images list if available
+      if (extractedImages.length > results.length && extractedImages[results.length]) {
+        imageUrl = extractedImages[results.length]
+        console.log(`Using extracted image for National Geographic article ${results.length + 1}: ${imageUrl}`)
+      }
+      
+      // Debug: Check what image elements exist
+      if (results.length < 2) {
+        console.log(`National Geographic Article ${results.length + 1} - Checking for image elements:`)
+        const backgroundDivs = $tile.find('div.BackgroundImage')
+        console.log(`  Background image divs found: ${backgroundDivs.length}`)
+        const specificBackgroundDivs = $tile.find('div.BackgroundImage.BackgroundImage--zoom.PromoTile__Header__Image')
+        console.log(`  PromoTile__Header__Image divs found: ${specificBackgroundDivs.length}`)
+        const altBackgroundDivs = $tile.find('div.BackgroundImage.BackgroundImage--zoom.PromoTile_Header__Image')
+        console.log(`  PromoTile_Header__Image divs found: ${altBackgroundDivs.length}`)
+        const regularImages = $tile.find('img')
+        console.log(`  Regular images found: ${regularImages.length}`)
+      }
+      
+      // Only try to find background images if we don't already have one from extraction
+      if (imageUrl === "/placeholder.svg") {
+        // First try to find background images using the exact selector from the Python scraper
+        let backgroundDiv = $tile.find('div.BackgroundImage.BackgroundImage--zoom.PromoTile__Header__Image').first()
+        if (backgroundDiv.length === 0) {
+          // Try alternative selector with single underscore
+          backgroundDiv = $tile.find('div.BackgroundImage.BackgroundImage--zoom.PromoTile_Header__Image').first()
+        }
+        if (backgroundDiv.length === 0) {
+          // Try any BackgroundImage div with zoom
+          backgroundDiv = $tile.find('div.BackgroundImage.BackgroundImage--zoom').first()
+        }
+        if (backgroundDiv.length === 0) {
+          // Try any BackgroundImage div
+          backgroundDiv = $tile.find('div.BackgroundImage').first()
+        }
+        if (backgroundDiv.length > 0) {
+          const style = backgroundDiv.attr('style') || ''
+          console.log(`National Geographic Article ${results.length + 1} - Background div style: ${style.substring(0, 100)}...`)
+          
+          // Extract background-image URL from style attribute using the exact regex from Python
+          const bgMatch = style.match(/background-image:\s*url\("([^"]+)"\)/)
+          if (bgMatch && bgMatch[1]) {
+            let imgSrc = bgMatch[1]
+            if (imgSrc.startsWith('//')) {
+              imgSrc = `https:${imgSrc}`
+            } else if (imgSrc.startsWith('/')) {
+              imgSrc = `https://www.nationalgeographic.com${imgSrc}`
+            }
+            imageUrl = imgSrc
+            console.log(`Found National Geographic background image: ${imageUrl}`)
+          } else {
+            console.log(`No background-image URL found in style: ${style}`)
+          }
+        }
+      }
+      
+      // Fallback: try to find any div with background-image style
+      if (imageUrl === "/placeholder.svg") {
+        $tile.find('div[style*="background-image"]').each((_, div) => {
+          const $div = $(div)
+          const style = $div.attr('style') || ''
+          // Use the exact regex pattern from the Python scraper
+          const bgMatch = style.match(/background-image:\s*url\("([^"]+)"\)/)
+          if (bgMatch && bgMatch[1]) {
+            let imgSrc = bgMatch[1]
+            if (imgSrc.startsWith('//')) {
+              imgSrc = `https:${imgSrc}`
+            } else if (imgSrc.startsWith('/')) {
+              imgSrc = `https://www.nationalgeographic.com${imgSrc}`
+            }
+            imageUrl = imgSrc
+            console.log(`Found National Geographic background image from fallback div: ${imageUrl}`)
+            return false // Break the loop
+          }
+        })
+      }
+      
+      // Final fallback: try regular img elements
+      if (imageUrl === "/placeholder.svg") {
+        const imgEl = $tile.find('img').first()
+        if (imgEl.length > 0) {
+          let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+          if (imgSrc) {
+            if (imgSrc.startsWith('//')) {
+              imgSrc = `https:${imgSrc}`
+            } else if (imgSrc.startsWith('/')) {
+              imgSrc = `https://www.nationalgeographic.com${imgSrc}`
+            }
+            imageUrl = imgSrc
+            console.log(`Found National Geographic regular image: ${imageUrl}`)
+          }
+        }
+      }
+
+      // If no image found, use National Geographic-themed placeholder
+      if (imageUrl === "/placeholder.svg") {
+        const natgeoImages = [
+          "https://www.nationalgeographic.com/content/dam/ngdotcom/rights-exports/homepage/2023/ng-logo-2fl.png",
+          "https://www.nationalgeographic.com/content/dam/ngdotcom/rights-exports/homepage/2023/space-hero.jpg",
+          "https://www.nationalgeographic.com/content/dam/ngdotcom/rights-exports/homepage/2023/astronomy-hero.jpg",
+          "https://www.nationalgeographic.com/content/dam/ngdotcom/rights-exports/homepage/2023/earth-hero.jpg"
+        ]
+        imageUrl = natgeoImages[Math.floor(Math.random() * natgeoImages.length)]
+      }
+
+      // Try to get a better date by fetching the individual article
+      let articleDate = new Date().toISOString()
+      
+      try {
+        console.log(`Fetching individual National Geographic article for date: ${link}`)
+        const articleResponse = await fetch(link, {
+          headers: {
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.5",
+            "accept-encoding": "gzip, deflate, br",
+            referer: "https://www.nationalgeographic.com/",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "upgrade-insecure-requests": "1",
+          },
+          cache: "no-store",
+        })
+
+        if (articleResponse.ok) {
+          const articleHtml = await articleResponse.text()
+          const $article = cheerio.load(articleHtml)
+          
+          // Look for date in National Geographic articles
+          // Based on the structure shown, dates are in divs with multiple classes
+          
+          // Debug: Log what we're looking for
+          if (results.length < 2) {
+            console.log(`National Geographic Article ${results.length + 1} - Checking for date elements`)
+          }
+          
+          const dateSelectors = [
+            'time[datetime]',
+            '.article-date',
+            '.publish-date',
+            '.byline-date',
+            '[data-testid="PublishDate"]',
+            '.timestamp',
+            '.date',
+            // National Geographic specific selectors based on the structure
+            'div[class*="jTKbV"][class*="zIIsP"][class*="ZdbeE"]',
+            'div[class*="JQYD"]',
+            'div[class*="QtiLO"]',
+            'div[class*="xAPpq"]',
+            // More generic selectors for date-like content
+            'div:contains("September")',
+            'div:contains("August")',
+            'div:contains("July")',
+            'div:contains("June")',
+            'div:contains("May")',
+            'div:contains("April")',
+            'div:contains("March")',
+            'div:contains("February")',
+            'div:contains("January")',
+            'div:contains("December")',
+            'div:contains("November")',
+            'div:contains("October")'
+          ]
+          
+          for (const dateSelector of dateSelectors) {
+            const dateEl = $article(dateSelector).first()
+            if (dateEl.length > 0) {
+              let dateStr = dateEl.attr('datetime') || dateEl.text().trim()
+              if (dateStr) {
+                // Try to parse the date string
+                let parsedDate = new Date(dateStr)
+                
+                // If direct parsing fails, try to handle National Geographic's format
+                if (isNaN(parsedDate.getTime())) {
+                  // Handle formats like "September 12, 2025", "Sep 12, 2025", etc.
+                  const natgeoDateMatch = dateStr.match(/([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})/i)
+                  if (natgeoDateMatch) {
+                    const [, month, day, year] = natgeoDateMatch
+                    parsedDate = new Date(`${month} ${day}, ${year}`)
+                  }
+                }
+                
+                if (!isNaN(parsedDate.getTime())) {
+                  articleDate = parsedDate.toISOString()
+                  console.log(`Found National Geographic date: "${dateStr}" -> ${articleDate}`)
+                  break
+                }
+              }
+            }
+          }
+          
+          // If no date found with selectors, try searching for date patterns in all text
+          if (articleDate === new Date().toISOString()) {
+            const allText = $article('body').text()
+            const datePatterns = [
+              /([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})/g, // "September 12, 2025"
+              /(\d{1,2})\/(\d{1,2})\/(\d{4})/g, // "9/12/2025"
+              /(\d{4})-(\d{1,2})-(\d{1,2})/g // "2025-09-12"
+            ]
+            
+            for (const pattern of datePatterns) {
+              const matches = allText.match(pattern)
+              if (matches && matches.length > 0) {
+                const dateStr = matches[0]
+                const parsedDate = new Date(dateStr)
+                if (!isNaN(parsedDate.getTime())) {
+                  articleDate = parsedDate.toISOString()
+                  console.log(`Found National Geographic date via text search: "${dateStr}" -> ${articleDate}`)
+                  break
+                }
+              }
+            }
+          }
+          
+          // Also try to get a better image from the individual article
+          if (imageUrl === "/placeholder.svg" || imageUrl.includes('ng-logo')) {
+            const imageSelectors = [
+              '.article-hero img',
+              '.featured-image img',
+              '.article-image img',
+              'figure img',
+              'article img',
+              'img[src*="nationalgeographic.com"]'
+            ]
+            
+            for (const imgSelector of imageSelectors) {
+              const imgEl = $article(imgSelector).first()
+              if (imgEl.length > 0) {
+                let imgSrc = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy-src')
+                if (imgSrc) {
+                  if (imgSrc.startsWith('//')) {
+                    imgSrc = `https:${imgSrc}`
+                  } else if (imgSrc.startsWith('/')) {
+                    imgSrc = `https://www.nationalgeographic.com${imgSrc}`
+                  }
+                  
+                  if (imgSrc.includes('nationalgeographic.com') && !imgSrc.includes('ng-logo')) {
+                    imageUrl = imgSrc
+                    console.log(`Found better National Geographic image: ${imgSrc}`)
+                    break
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (articleError) {
+        console.log(`Could not fetch individual National Geographic article: ${articleError}`)
+      }
+
+      const article: Article = {
+        id: generateIdFromLink(link),
+        title: title.slice(0, 200),
+        summary: title.slice(0, 300), // Use title as summary for now
+        content: `Read the full National Geographic article: ${link}`,
+        imageUrl: imageUrl,
+        date: articleDate,
+        source: "National Geographic",
+      }
+
+      results.push(article)
+    }
+
+    console.log(`Found ${results.length} National Geographic articles`)
+    return results.slice(0, 8) // Limit to 8 articles for faster loading
+
+  } catch (error) {
+    console.log(`Error fetching National Geographic news:`, error)
+    throw error
+  }
+}
+
+async function scrapeSpaceNews(): Promise<Article[]> {
+  // Try multiple Space.com URLs
+  const urls = [
+    "https://www.space.com/news",
+    "https://www.space.com/news/",
+    "https://www.space.com/",
+  ]
+
+  const headers = {
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.5",
+    "accept-encoding": "gzip, deflate, br",
+    referer: "https://www.google.com/",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "cross-site",
+    "upgrade-insecure-requests": "1",
+  }
+
+  for (const url of urls) {
+    try {
+      console.log(`Scraping Space.com news: ${url}`)
+      
+      const res = await fetch(url, {
+        headers,
+        cache: "no-store",
+      })
+
+      if (!res.ok) {
+        console.log(`Failed to fetch ${url}: ${res.status}`)
+        continue
+      }
+
+      const html = await res.text()
+      if (!html || html.length < 100) {
+        console.log(`Empty response from ${url}`)
+        continue
+      }
+
+      const $ = cheerio.load(html)
+      const results: Article[] = []
+
+      // Try multiple selectors for Space.com articles
+      const selectors = [
+        "article",
+        ".listingResult",
+        ".news-item", 
+        ".article-item",
+        "[data-module='ArticleListItem']",
+        ".vanilla-image-block",
+        ".hawk-item",
+        ".summary-item",
+        ".entry-title",
+        "[class*='article']",
+        "[class*='post']",
+      ]
+
+      for (const selector of selectors) {
+        console.log(`Trying Space.com selector: ${selector} on ${url}`)
+        
+        $(selector).each((_, el) => {
+          const $el = $(el)
+          let title = ""
+          let link = ""
+          let summary = ""
+          let imageUrl = "/placeholder.svg"
+          
+          // Method 1: Look for article title and link
+          const titleLink = $el.find("h1 a, h2 a, h3 a, .article-name a, .article-link, .entry-title a").first()
+          if (titleLink.length > 0) {
+            title = titleLink.text().trim()
+            link = titleLink.attr("href") || ""
+          }
+          
+          // Method 2: Look for title in various heading tags
+          if (!title) {
+            const titleEl = $el.find("h1, h2, h3, h4, .title, [class*='title'], [class*='name'], .entry-title").first()
+            title = titleEl.text().trim()
+            
+            if (!link) {
+              const linkEl = $el.find("a").first()
+              link = linkEl.attr("href") || ""
+            }
+          }
+          
+          // Method 3: Check if element itself is a link
+          if (!title && $el.is("a")) {
+            title = $el.text().trim()
+            link = $el.attr("href") || ""
+          }
+          
+          // Extract image from various sources with more comprehensive approach
+          const imageSelectors = [
+            'figure[data-original]',
+            'figure img',
+            'img[data-original]',
+            'img[data-src]', 
+            'img[data-lazy-src]',
+            'img.lazy',
+            'img[src*="space.com"]',
+            'img[src*="cdn.mos.cms.futurecdn.net"]',
+            '.article-image img',
+            '.listing-image img',
+            '.vanilla-image-block img',
+            'picture img',
+            'img[src]'
+          ]
+          
+          for (const imgSelector of imageSelectors) {
+            const imgEl = $el.find(imgSelector).first()
+            if (imgEl.length > 0) {
+              // Try multiple data attributes and src
+              let imgSrc = imgEl.attr('data-original') || 
+                          imgEl.attr('data-src') || 
+                          imgEl.attr('data-lazy-src') ||
+                          imgEl.attr('srcset')?.split(' ')[0] ||
+                          imgEl.attr('src') ||
+                          imgEl.parent().attr('data-original')
+              
+              if (imgSrc) {
+                // Clean up srcset format if present
+                if (imgSrc.includes(' ')) {
+                  imgSrc = imgSrc.split(' ')[0]
+                }
+                
+                // Ensure absolute URL
+                if (imgSrc.startsWith('//')) {
+                  imgSrc = `https:${imgSrc}`
+                } else if (imgSrc.startsWith('/')) {
+                  imgSrc = `https://www.space.com${imgSrc}`
+                }
+                
+                // Validate it's a proper image URL and not a placeholder
+                if (imgSrc && 
+                    !imgSrc.includes('placeholder') && 
+                    !imgSrc.includes('data:image') &&
+                    (imgSrc.includes('space.com') || imgSrc.includes('futurecdn.net')) &&
+                    (imgSrc.includes('.jpg') || imgSrc.includes('.jpeg') || 
+                     imgSrc.includes('.png') || imgSrc.includes('.webp'))) {
+                  imageUrl = imgSrc
+                  break
+                }
+              }
+            }
+          }
+          
+          // If no image found, assign a thematic space image based on title keywords
+          if (imageUrl === "/placeholder.svg" && title) {
+            const spaceImages = [
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-space-1.jpg", // Generic space
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-moon-1.jpg", // Moon/lunar
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-mars-1.jpg", // Mars
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-telescope-1.jpg", // Telescope
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-galaxy-1.jpg", // Galaxy
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-rocket-1.jpg", // Rocket
+              "https://cdn.mos.cms.futurecdn.net/YzQzNzQzNzQzNzQz-saturn-1.jpg" // Saturn
+            ]
+            
+            const lowerTitle = title.toLowerCase()
+            if (lowerTitle.includes('moon') || lowerTitle.includes('lunar') || lowerTitle.includes('eclipse')) {
+              imageUrl = spaceImages[1]
+            } else if (lowerTitle.includes('mars') || lowerTitle.includes('rover')) {
+              imageUrl = spaceImages[2]
+            } else if (lowerTitle.includes('webb') || lowerTitle.includes('telescope') || lowerTitle.includes('hubble')) {
+              imageUrl = spaceImages[3]
+            } else if (lowerTitle.includes('galaxy') || lowerTitle.includes('star') || lowerTitle.includes('dust')) {
+              imageUrl = spaceImages[4]
+            } else if (lowerTitle.includes('spacex') || lowerTitle.includes('rocket') || lowerTitle.includes('launch')) {
+              imageUrl = spaceImages[5]
+            } else if (lowerTitle.includes('saturn') || lowerTitle.includes('planet')) {
+              imageUrl = spaceImages[6]
+            } else {
+              // Default to a random space image
+              imageUrl = spaceImages[Math.floor(Math.random() * spaceImages.length)]
+            }
+          }
+          
+          // Clean up title - remove extra whitespace and metadata
+          if (title) {
+            title = title.replace(/\s+/g, ' ').replace(/By\s+.*?last updated.*$/i, '').trim()
+            if (title.includes('Homepage') || title.includes('Video') || title.length < 10) {
+              return // Skip non-article content
+            }
+          }
+          
+          // Get summary/description
+          const summaryEl = $el.find(".summary, .description, .excerpt, p").first()
+          summary = summaryEl.text().trim() || title
+
+          if (title && link && title.length > 10 && !title.toLowerCase().includes('homepage')) {
+            // Ensure absolute URL
+            if (link.startsWith("/")) {
+              link = `https://www.space.com${link}`
+            } else if (!link.startsWith("http")) {
+              link = `https://www.space.com/${link}`
+            }
+            
+            const article: Article = {
+              id: generateIdFromLink(link),
+              title: title.slice(0, 200),
+              summary: summary.slice(0, 300) || title.slice(0, 300),
+              content: `Read the full article at Space.com: ${link}`,
+              imageUrl: imageUrl,
+              date: new Date().toISOString(),
+              source: "Space.com",
+            }
+
+            results.push(article)
+          }
+        })
+
+        if (results.length > 0) {
+          console.log(`Found ${results.length} articles with selector: ${selector} from ${url}`)
+          return results.slice(0, 8) // Limit to 8 articles for faster loading
+        }
+      }
+
+      console.log(`No articles found at ${url}`)
+    } catch (error) {
+      console.log(`Error fetching ${url}:`, error)
+      continue
+    }
+  }
+
+  throw new Error("Could not scrape any articles from Space.com URLs")
+}
+
+// Fallback space articles in case scraping fails
+const fallbackSpaceArticles: Article[] = [
+  {
+    id: "space-1",
+    title: "SpaceX Starship Successfully Completes Orbital Test Flight",
+    summary: "The massive rocket achieved key milestones in its journey toward Mars missions.",
+    content: "SpaceX's Starship has completed another successful test flight, bringing the company closer to its goal of Mars colonization. The vehicle demonstrated improved heat shield performance and landing capabilities...",
+    imageUrl: "https://cdn.mos.cms.futurecdn.net/placeholder-spacex-starship.jpg",
+    date: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000).toISOString(),
+    source: "Space.com",
+  },
+  {
+    id: "space-2", 
+    title: "Astronomers Detect Mysterious Radio Signals from Distant Galaxy",
+    summary: "Fast radio bursts reveal new insights about the universe's magnetic fields.",
+    content: "A team of astronomers has detected a series of mysterious radio signals originating from a galaxy billions of light-years away. These fast radio bursts could help scientists understand cosmic magnetism...",
+    imageUrl: "https://cdn.mos.cms.futurecdn.net/placeholder-radio-telescope.jpg",
+    date: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000).toISOString(),
+    source: "Space.com",
+  },
+  {
+    id: "space-3",
+    title: "China's Space Station Receives New Research Modules",
+    summary: "Tiangong space station expands capabilities for scientific experiments.",
+    content: "China has successfully attached new research modules to its Tiangong space station, significantly expanding the facility's scientific capabilities for microgravity research...",
+    imageUrl: "https://cdn.mos.cms.futurecdn.net/placeholder-tiangong-station.jpg", 
+    date: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000).toISOString(),
+    source: "Space.com",
+  },
+  {
+    id: "space-4",
+    title: "Europa Clipper Mission Launches to Jupiter's Icy Moon",
+    summary: "NASA probe begins journey to search for signs of life in Europa's subsurface ocean.",
+    content: "NASA's Europa Clipper spacecraft has begun its journey to Jupiter's moon Europa, where it will investigate the moon's subsurface ocean and potential for harboring life...",
+    imageUrl: "https://cdn.mos.cms.futurecdn.net/placeholder-europa-clipper.jpg",
+    date: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000).toISOString(),
+    source: "Space.com",
+  },
+  {
+    id: "space-5",
+    title: "Breakthrough in Fusion Rocket Technology Could Enable Faster Mars Travel",
+    summary: "New propulsion system could cut Mars journey time to just 3 months.",
+    content: "Scientists have achieved a major breakthrough in fusion rocket technology that could revolutionize space travel, potentially reducing the journey time to Mars from 9 months to just 3 months...",
+    imageUrl: "https://cdn.mos.cms.futurecdn.net/placeholder-fusion-rocket.jpg",
+    date: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000).toISOString(),
+    source: "Space.com",
+  },
+]
+
+export async function GET(request: Request) {
+  try {
+    console.log("Space News API: Starting scrape attempt...")
+    
+    // Check cache first
+    const now = Date.now()
+    if (articleCache && (now - articleCache.timestamp) < CACHE_TTL) {
+      console.log("Returning cached articles")
+      const oneWeekAgo = new Date()
+      oneWeekAgo.setDate(oneWeekAgo.getDate() - 7)
+      
+      const recentArticles = articleCache.data.filter(article => {
+        const articleDate = new Date(article.date)
+        return articleDate >= oneWeekAgo
+      })
+      
+      const limitedArticles = recentArticles.slice(0, 15)
+      
+      return NextResponse.json({ 
+        articles: limitedArticles,
+        sources: {
+          nasa: limitedArticles.filter(a => a.source === "NASA").length,
+          natgeo: limitedArticles.filter(a => a.source === "National Geographic").length,
+          space: limitedArticles.filter(a => a.source === "Space.com").length
+        },
+        cached: true,
+        filtered: {
+          total: articleCache.data.length,
+          recent: recentArticles.length,
+          returned: limitedArticles.length
+        }
+      })
+    }
+    
+    const allArticles: Article[] = []
+    let errors: string[] = []
+    
+    // Calculate date range for past week
+    const oneWeekAgo = new Date()
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7)
+    const oneWeekAgoISO = oneWeekAgo.toISOString()
+    
+    console.log(`Filtering articles from past week: ${oneWeekAgoISO} onwards`)
+    
+    // Try to scrape NASA articles
+    try {
+      const nasaArticles = await scrapeNasaNews()
+      console.log(`NASA News API: Successfully scraped ${nasaArticles.length} articles`)
+      allArticles.push(...nasaArticles)
+    } catch (nasaError) {
+      console.log("NASA News API: Scraping failed:", (nasaError as Error).message)
+      errors.push("NASA scraping failed")
+    }
+    
+    // Try to scrape National Geographic articles
+    try {
+      const natgeoArticles = await scrapeNatGeoSpace()
+      console.log(`National Geographic API: Successfully scraped ${natgeoArticles.length} articles`)
+      allArticles.push(...natgeoArticles)
+    } catch (natgeoError) {
+      console.log("National Geographic API: Scraping failed:", (natgeoError as Error).message)
+      errors.push("National Geographic scraping failed")
+    }
+    
+    // Try to scrape Space.com articles
+    try {
+      const spaceArticles = await scrapeSpaceNews()
+      console.log(`Space News API: Successfully scraped ${spaceArticles.length} articles`)
+      allArticles.push(...spaceArticles)
+    } catch (spaceError) {
+      console.log("Space News API: Scraping failed:", (spaceError as Error).message)
+      errors.push("Space.com scraping failed")
+    }
+    
+    // If we have articles from either source, filter and return them
+    if (allArticles.length > 0) {
+      // Filter articles to only include those from the past week
+      const recentArticles = allArticles.filter(article => {
+        const articleDate = new Date(article.date)
+        return articleDate >= oneWeekAgo
+      })
+      
+      console.log(`Filtered ${allArticles.length} articles down to ${recentArticles.length} from past week`)
+      
+      // Sort by date (newest first)
+      recentArticles.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      
+      // Limit to top 15 articles for faster loading
+      const limitedArticles = recentArticles.slice(0, 15)
+      
+      // Update cache
+      articleCache = {
+        data: allArticles,
+        timestamp: now
+      }
+      
+      return NextResponse.json({ 
+        articles: limitedArticles,
+        sources: {
+          nasa: limitedArticles.filter(a => a.source === "NASA").length,
+          natgeo: limitedArticles.filter(a => a.source === "National Geographic").length,
+          space: limitedArticles.filter(a => a.source === "Space.com").length
+        },
+        errors: errors.length > 0 ? errors : undefined,
+        filtered: {
+          total: allArticles.length,
+          recent: recentArticles.length,
+          returned: limitedArticles.length
+        }
+      })
+    }
+    
+    // If both scraping attempts failed, use fallback articles
+    console.log("Both scraping attempts failed, using fallback articles")
+    const fallbackWithNote = fallbackSpaceArticles.map(article => ({
+      ...article,
+      summary: `${article.summary} (Note: Live feeds temporarily unavailable)`,
+    }))
+    
+    return NextResponse.json({ 
+      articles: fallbackWithNote,
+      note: "Using fallback space articles - live scraping temporarily unavailable",
+      errors: errors
+    })
+    
+  } catch (error: unknown) {
+    console.error("Space News API: Fatal error:", error)
+    return NextResponse.json(
+      { error: (error as Error).message ?? "Failed to load space articles." },
+      { status: 500 },
+    )
+  }
+}
+
+
